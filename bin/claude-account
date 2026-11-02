@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""Switch the Claude Code login while sharing everything else.
+
+Only two things are account-specific:
+  ~/.claude/.credentials.json   OAuth tokens
+  ~/.claude.json -> oauthAccount  cached profile of the logged-in account
+Each saved account keeps a copy of both in ~/.claude/accounts/<name>/.
+
+Usage:
+  claude-account                    list saved accounts, mark the active one
+  claude-account save <name>        save the current login as <name>
+  claude-account use <name>         switch to <name>; a new name signs out so the next
+                                    claude start asks for a browser login, saved as <name>
+  claude-account sync               write the live login back to its saved copy
+  claude-account import <name> <config-dir>
+                                    save the login from a separate CLAUDE_CONFIG_DIR
+"""
+import json
+import os
+import sys
+from pathlib import Path
+
+HOME = Path.home()
+CREDS = HOME / ".claude" / ".credentials.json"
+GLOBAL = HOME / ".claude.json"
+STORE = HOME / ".claude" / "accounts"
+PENDING = STORE / ".pending"
+
+
+def read_json(path):
+    with open(path) as f:
+        return json.load(f)
+
+
+def write_json(path, data, mode=0o600):
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def identity(oauth):
+    return (oauth.get("accountUuid"), oauth.get("organizationUuid"))
+
+
+def label(oauth):
+    return f"{oauth.get('emailAddress')} / {oauth.get('organizationName')}"
+
+
+def saved():
+    out = {}
+    if STORE.is_dir():
+        for d in sorted(STORE.iterdir()):
+            if (d / "credentials.json").is_file() and (d / "oauth.json").is_file():
+                out[d.name] = read_json(d / "oauth.json")
+    return out
+
+
+def store(name, creds, oauth):
+    d = STORE / name
+    d.mkdir(parents=True, exist_ok=True, mode=0o700)
+    write_json(d / "credentials.json", creds)
+    write_json(d / "oauth.json", oauth)
+
+
+def active_name():
+    oauth = read_json(GLOBAL).get("oauthAccount")
+    if not oauth:
+        return None
+    for name, o in saved().items():
+        if identity(o) == identity(oauth):
+            return name
+    return None
+
+
+def save_live():
+    """Write the live login back to its slot; a fresh login goes to the pending name."""
+    oauth = read_json(GLOBAL).get("oauthAccount")
+    if not oauth or not CREDS.is_file():
+        return None
+    name = active_name()
+    if name is None and PENDING.is_file():
+        name = PENDING.read_text().strip()
+        PENDING.unlink()
+    if name is None:
+        return None
+    store(name, read_json(CREDS), oauth)
+    return name
+
+
+def cmd_list():
+    accounts = saved()
+    if not accounts:
+        print("no saved accounts; log in with /login, then: claude-account save <name>")
+        return
+    current = active_name()
+    for name, o in accounts.items():
+        mark = "*" if name == current else " "
+        print(f"{mark} {name:12} {label(o)}")
+
+
+def cmd_save(name):
+    oauth = read_json(GLOBAL).get("oauthAccount")
+    if not oauth or not CREDS.is_file():
+        sys.exit("not logged in")
+    store(name, read_json(CREDS), oauth)
+    print(f"saved {name}: {label(oauth)}")
+
+
+def cmd_import(name, config_dir):
+    d = Path(config_dir).expanduser()
+    oauth = read_json(d / ".claude.json").get("oauthAccount")
+    if not oauth:
+        sys.exit(f"no login in {d}")
+    store(name, read_json(d / ".credentials.json"), oauth)
+    print(f"imported {name}: {label(oauth)}")
+
+
+def cmd_use(name):
+    # Tokens refresh while in use; write the live ones back before leaving.
+    if save_live() is None and CREDS.is_file():
+        print("warning: current login is not saved under any name; it is being replaced",
+              file=sys.stderr)
+
+    target = STORE / name
+    if not (target / "credentials.json").is_file():
+        CREDS.unlink(missing_ok=True)
+        cfg = read_json(GLOBAL)
+        cfg.pop("oauthAccount", None)
+        write_json(GLOBAL, cfg, mode=os.stat(GLOBAL).st_mode & 0o777)
+        STORE.mkdir(parents=True, exist_ok=True, mode=0o700)
+        PENDING.write_text(name + "\n")
+        print(f"new account {name}: signed out; log in from claude, the login is saved as {name}")
+        return
+
+    oauth = read_json(target / "oauth.json")
+    write_json(CREDS, read_json(target / "credentials.json"))
+    cfg = read_json(GLOBAL)
+    cfg["oauthAccount"] = oauth
+    write_json(GLOBAL, cfg, mode=os.stat(GLOBAL).st_mode & 0o777)
+    print(f"active: {name} ({label(oauth)})")
+
+
+def cmd_sync():
+    name = save_live()
+    if name:
+        print(f"saved {name}")
+
+
+def main(argv):
+    if not argv or argv[0] == "list":
+        cmd_list()
+    elif argv[0] == "save" and len(argv) == 2:
+        cmd_save(argv[1])
+    elif argv[0] == "use" and len(argv) == 2:
+        cmd_use(argv[1])
+    elif argv[0] == "sync" and len(argv) == 1:
+        cmd_sync()
+    elif argv[0] == "import" and len(argv) == 3:
+        cmd_import(argv[1], argv[2])
+    else:
+        sys.exit(__doc__)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
